@@ -1,7 +1,4 @@
-# Tampermonkey Scripts for OLX
-
-OLX is making me do evil things when it defaults to different settings based on the listings' categories. These scripts atleast make it bearable to use on PC
-
+# My scripts
 ## Scripts
 
 ### 1. Open all new favourites
