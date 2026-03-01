@@ -1,9 +1,9 @@
 // ==UserScript==
 // @name         Bazar GG.deals Price Comparison
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      4.0
 // @description  Show lowest GG.deals prices on Bazar
-// @author       You
+// @author       puksh
 // @match        https://bazar.lowcygier.pl/*
 // @grant        GM_xmlhttpRequest
 // @connect      gg.deals
@@ -16,56 +16,74 @@
 	const processed = new Set()
 	const cache = new Map()
 	const GG_LOGO = 'https://bazar.lowcygier.pl/images/icons/gg.svg'
+	const CACHE_TTL = 3600000 // 1 hour
 
 	// Inject CSS
 	const style = document.createElement('style')
 	style.textContent = `
         .gg-price-container {
-            position: absolute;
-            left: -115px;
-            top: 50%;
-            transform: translateY(-50%);
-            width: 110px;
-            padding: 4px;
-            border-radius: 6px;
-            transition: all 0.3s ease;
-            cursor: pointer;
-        }
-        .gg-price-container.gg-cheaper {
-            background: linear-gradient(135deg, #4CAF50 0%, #45a049 100%);
-        }
-        .gg-price-container.gg-expensive {
-            background: linear-gradient(135deg, #ff6b6b 0%, #ff5252 100%);
-        }
-        .gg-price-container.gg-similar {
-            background: linear-gradient(135deg, #c06c00 0%, #e07d00 100%);
-        }
-        .gg-price-container:hover {
-            transform: translateY(-50%) translateY(-2px);
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
-        }
-        .gg-price-loading {
-            background: #f5f5f5 !important;
-        }
-        .gg-price-content {
             display: flex;
             align-items: center;
             justify-content: center;
-            gap: 6px;
-            color: white;
-            font-weight: 600;
-            font-size: 20px;
+            gap: 12px;
+            padding: 8px 0;
+            width: 220px;
         }
-        .gg-logo {
-            width: 22px;
+        .price-section {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+            cursor: pointer;
+            padding: 4px 8px;
+            border-radius: 4px;
+            transition: background 0.2s ease;
+        }
+        .price-section:hover {
+            background: rgba(0, 0, 0, 0.05);
+        }
+        .price-section.no-hover {
+            cursor: default;
+        }
+        .price-section.no-hover:hover {
+            background: transparent;
+        }
+        .price-label {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            cursor: pointer;
+        }
+        .price-value {
+            font-weight: 600;
+            font-size: 16px;
+        }
+        .price-value.cheaper {
+            font-size: 20px;
+            font-weight: 700;
+            color: #4CAF50;
+        }
+        .price-value.expensive {
+            color: #ff5252;
+            opacity: 0.5;
+        }
+        .price-separator {
+            width: 2px;
+            height: 40px;
+            background: rgba(0, 0, 0, 0.1);
+        }
+        .gg-logo-small {
+            width: 14px;
             height: auto;
-            display: block;
+            display: inline-block;
+            vertical-align: middle;
+            margin-right: 4px;
         }
         .gg-spinner {
-            width: 14px;
-            height: 14px;
-            border: 2px solid #f3f3f3;
-            border-top: 2px solid #c06c00;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #c06c00;
             border-radius: 50%;
             animation: spin 0.8s linear infinite;
         }
@@ -74,12 +92,14 @@
             100% { transform: rotate(360deg); }
         }
         .gg-error {
-            background: rgba(192, 108, 0, 0.3) !important;
-            color: white;
+            color: #999;
+            text-align: center;
         }
         .gg-search-hint {
             font-size: 10px;
-            opacity: 0.9;
+            opacity: 0.7;
+            color: rgb(208, 214, 213);
+            cursor: pointer;
         }
     `
 	document.head.appendChild(style)
@@ -93,17 +113,15 @@
 	}
 
 	function getAlternativeNames(gameName) {
-		const alternatives = []
+		const alternatives = [gameName]
 		const specialChars = /[@:+&|()[\]{}]/
 
 		if (specialChars.test(gameName)) {
-			// Try name before special character
 			const beforeSpecial = gameName.split(/[@:+&|()[\]{}]/)[0].trim()
 			if (beforeSpecial && beforeSpecial !== gameName) {
 				alternatives.push(beforeSpecial)
 			}
 
-			// Try removing special characters
 			const withoutSpecial = gameName.replace(/[@:+&|()[\]{}]/g, ' ').trim()
 			if (withoutSpecial !== gameName && withoutSpecial !== beforeSpecial) {
 				alternatives.push(withoutSpecial)
@@ -115,220 +133,188 @@
 
 	function parseBazarPrice(priceBlock) {
 		const priceText = priceBlock.textContent.trim()
+		const match = priceText.match(/(?:od\s*)?(\d+[.,]\d+)/i)
+		return match ? parseFloat(match[1].replace(',', '.')) : null
+	}
 
-		let match = priceText.match(/od\s*(\d+[.,]\d+)/i)
-		if (match) {
-			const price = parseFloat(match[1].replace(',', '.'))
-			return price
-		}
+	function extractGGPrice(html) {
+		const doc = new DOMParser().parseFromString(html, 'text/html')
 
-		match = priceText.match(/(\d+[.,]\d+)\s*zł/i)
-		if (match) {
-			const price = parseFloat(match[1].replace(',', '.'))
-			return price
+		const el = doc.querySelector('.price.price-hl, .price.price-best')
+		if (el) {
+			const cleaned = el.textContent.trim().replace(/[^\d.,]/g, '').replace(',', '.')
+			const price = parseFloat(cleaned)
+			if (!isNaN(price) && price > 0) return price
 		}
 
 		return null
 	}
 
-	function parseGGPrice(priceText) {
-		const cleaned = priceText.replace(/[^\d.,]/g, '').replace(',', '.')
-		const price = parseFloat(cleaned)
-		return isNaN(price) ? null : price
-	}
-
-	function createPriceElement(gameName) {
+	function createPriceElement(bazarPrice, bazarUrl) {
 		const container = document.createElement('div')
-		container.className = 'gg-price-container gg-price-loading'
+		container.className = 'gg-price-container'
+		container.innerHTML = `
+			<div class="price-section bazar-price">
+				<span class="price-label">Bazar</span>
+				<span class="price-value">${bazarPrice ? bazarPrice.toFixed(2) : '?'} zł</span>
+			</div>
+			<div class="price-separator"></div>
+			<div class="price-section gg-price">
+				<span class="price-label"><img src="${GG_LOGO}" class="gg-logo-small" alt="GG.deals">GG.deals</span>
+				<div class="gg-spinner"></div>
+			</div>
+		`
 
-		const content = document.createElement('div')
-		content.className = 'gg-price-content'
-		content.innerHTML = `
-            <img src="${GG_LOGO}" class="gg-logo" alt="GG.deals">
-            <div class="gg-spinner"></div>
-        `
+		// Attach Bazar click handler immediately
+		const bazarSection = container.querySelector('.bazar-price')
+		bazarSection.addEventListener('mousedown', (e) => {
+			e.stopPropagation()
+			if (e.button === 1) {
+				e.preventDefault()
+				window.open(bazarUrl, '_blank')
+			} else if (e.button === 0) {
+				window.open(bazarUrl, '_self')
+			}
+		})
 
-		container.appendChild(content)
-
-		return { container, content }
+		return container
 	}
 
-	function updatePriceElement(content, ggPrice, bazarPrice, gameName, notFound = false) {
-		const container = content.closest('.gg-price-container')
-		container.classList.remove('gg-price-loading')
+	function updatePriceElement(container, ggPrice, bazarPrice, gameName, bazarUrl, notFound = false) {
+		const ggSection = container.querySelector('.gg-price')
 
 		if (notFound) {
-			container.classList.add('gg-error')
-			container.addEventListener('mousedown', (e) => {
-				const url = `https://gg.deals/games/?title=${encodeURIComponent(gameName)}`
+			const searchUrl = `https://gg.deals/games/?title=${encodeURIComponent(gameName)}`
+			ggSection.innerHTML = `
+				<span class="price-label"><img src="${GG_LOGO}" class="gg-logo-small" alt="GG.deals">GG.deals</span>
+				<span class="gg-search-hint">Click to search</span>
+			`
+			ggSection.addEventListener('mousedown', (e) => {
+				e.stopPropagation()
 				if (e.button === 1) {
-					// Middle click
 					e.preventDefault()
-					window.open(url, '_blank')
+					window.open(searchUrl, '_blank')
 				} else if (e.button === 0) {
-					// Left click
-					window.open(url, '_self')
+					window.open(searchUrl, '_self')
 				}
 			})
-			content.innerHTML = `
-                <img src="${GG_LOGO}" class="gg-logo" alt="GG.deals">
-                <span class="gg-search-hint">🔍 Click to search</span>
-            `
 			return
 		}
 
 		if (ggPrice === null) {
-			container.classList.add('gg-error')
-			content.innerHTML = `
-                <img src="${GG_LOGO}" class="gg-logo" alt="GG.deals">
-                <span>Error</span>
-            `
+			ggSection.innerHTML = `
+				<span class="price-label"><img src="${GG_LOGO}" class="gg-logo-small" alt="GG.deals">GG.deals</span>
+				<span class="gg-error">Error</span>
+			`
 			return
 		}
 
-		let colorClass = 'gg-similar'
+		let bazarClass = ''
+		let ggClass = ''
 
 		if (bazarPrice !== null && ggPrice !== null) {
 			const diff = bazarPrice - ggPrice
-
 			if (diff > 0.25) {
-				colorClass = 'gg-cheaper'
+				ggClass = 'cheaper'
 			} else if (diff < -0.75) {
-				colorClass = 'gg-expensive'
-			} else {
-				colorClass = 'gg-similar'
+				bazarClass = 'cheaper'
+				ggClass = 'expensive'
 			}
 		}
 
-		container.classList.add(colorClass)
+		// Update Bazar styling if needed
+		if (bazarClass) {
+			const bazarValue = container.querySelector('.bazar-price .price-value')
+			bazarValue.className = `price-value ${bazarClass}`
+		}
 
-		content.innerHTML = `
-            <img src="${GG_LOGO}" class="gg-logo" alt="GG.deals">
-            <span>${ggPrice.toFixed(2)} zł</span>
-        `
+		const ggUrl = `https://gg.deals/game/${normalizeGameName(gameName)}/`
 
-		container.addEventListener('mousedown', (e) => {
-			const url = `https://gg.deals/game/${normalizeGameName(gameName)}/`
+		ggSection.innerHTML = `
+			<span class="price-label"><img src="${GG_LOGO}" class="gg-logo-small" alt="GG.deals">GG.deals</span>
+			<span class="price-value ${ggClass}">${ggPrice.toFixed(2)} zł</span>
+		`
+
+		ggSection.addEventListener('mousedown', (e) => {
+			e.stopPropagation()
 			if (e.button === 1) {
-				// Middle click
 				e.preventDefault()
-				window.open(url, '_blank')
+				window.open(ggUrl, '_blank')
 			} else if (e.button === 0) {
-				// Left click
-				window.open(url, '_self')
+				window.open(ggUrl, '_self')
 			}
 		})
 	}
 
-	function tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives = null, index = 0) {
-		if (alternatives === null) {
-			alternatives = getAlternativeNames(gameName)
-		}
+	async function fetchAllAlternatives(alternatives) {
+		const promises = alternatives.map(altName => {
+			return new Promise((resolve) => {
+				const normalized = normalizeGameName(altName)
+				const url = `https://gg.deals/game/${normalized}/`
 
-		if (index >= alternatives.length) {
-			// All alternatives exhausted
-			const normalized = normalizeGameName(gameName)
-			cache.set(normalized, { price: null, notFound: true })
-			updatePriceElement(content, null, bazarPrice, gameName, true)
-			return
-		}
-
-		const alternativeName = alternatives[index]
-		const normalized = normalizeGameName(alternativeName)
-
-		const url = `https://gg.deals/game/${normalized}/`
-
-		GM_xmlhttpRequest({
-			method: 'GET',
-			url: url,
-			timeout: 10000,
-			onload: function (response) {
-				if (response.finalUrl.includes('/games/?') || response.status === 404) {
-					// Try next alternative
-					tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, index + 1)
-					return
-				}
-
-				const parser = new DOMParser()
-				const doc = parser.parseFromString(response.responseText, 'text/html')
-				const keyshopLink = doc.querySelector('a[href="#keyshops"]')
-				const priceSpan = keyshopLink ? keyshopLink.querySelector('.price-inner.numeric') : null
-
-				if (!priceSpan) {
-					// Try next alternative
-					tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, index + 1)
-					return
-				}
-
-				const ggPrice = parseGGPrice(priceSpan.textContent.trim())
-				const originalNormalized = normalizeGameName(gameName)
-				cache.set(originalNormalized, { price: ggPrice, notFound: false })
-				updatePriceElement(content, ggPrice, bazarPrice, alternativeName, false)
-			},
-			onerror: function () {
-				tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, index + 1)
-			},
-			ontimeout: function () {
-				tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, index + 1)
-			},
+				GM_xmlhttpRequest({
+					method: 'GET',
+					url: url,
+					timeout: 8000,
+					onload: function (response) {
+						// Page doesn't exist — redirected to search or 404
+						if (response.finalUrl.includes('/games/?') || response.status === 404) {
+							resolve({ name: altName, price: null, pageFound: false })
+							return
+						}
+						// Page exists even if price couldn't be parsed
+						const ggPrice = extractGGPrice(response.responseText)
+						resolve({ name: altName, price: ggPrice, pageFound: true })
+					},
+					onerror: () => resolve({ name: altName, price: null, pageFound: false }),
+					ontimeout: () => resolve({ name: altName, price: null, pageFound: false }),
+				})
+			})
 		})
+
+		const results = await Promise.all(promises)
+
+		// Prefer a result with both page and price
+		const withPrice = results.find(r => r.pageFound && r.price !== null)
+		if (withPrice) return { ...withPrice, found: true }
+
+		// Page found but no price (no keyshop listings etc.)
+		const pageOnly = results.find(r => r.pageFound)
+		if (pageOnly) return { ...pageOnly, found: true }
+
+		// Nothing found at all
+		return { price: null, found: false, name: alternatives[0] }
 	}
 
-	function fetchGGDealsPrice(gameName, content, bazarPrice) {
+	function fetchGGDealsPrice(gameName, container, bazarPrice, bazarUrl) {
 		const normalized = normalizeGameName(gameName)
 
+		// Check cache with TTL
 		if (cache.has(normalized)) {
 			const cached = cache.get(normalized)
-			updatePriceElement(content, cached.price, bazarPrice, gameName, cached.notFound)
-			return
+			if (Date.now() - cached.timestamp < CACHE_TTL) {
+				updatePriceElement(container, cached.price, bazarPrice, gameName, bazarUrl, cached.notFound)
+				return
+			}
+			cache.delete(normalized)
 		}
 
-		const url = `https://gg.deals/game/${normalized}/`
+		const alternatives = getAlternativeNames(gameName)
+		fetchAllAlternatives(alternatives).then(result => {
+			cache.set(normalized, {
+				price: result.price,
+				notFound: !result.found,
+				timestamp: Date.now()
+			})
 
-		GM_xmlhttpRequest({
-			method: 'GET',
-			url: url,
-			timeout: 10000,
-			onload: function (response) {
-				if (response.finalUrl.includes('/games/?') || response.status === 404) {
-					// Try alternatives if available
-					const alternatives = getAlternativeNames(gameName)
-					if (alternatives.length > 0) {
-						tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, 0)
-					} else {
-						cache.set(normalized, { price: null, notFound: true })
-						updatePriceElement(content, null, bazarPrice, gameName, true)
-					}
-					return
-				}
-
-				const parser = new DOMParser()
-				const doc = parser.parseFromString(response.responseText, 'text/html')
-				const keyshopLink = doc.querySelector('a[href="#keyshops"]')
-				const priceSpan = keyshopLink ? keyshopLink.querySelector('.price-inner.numeric') : null
-
-				if (!priceSpan) {
-					// Try alternatives if available
-					const alternatives = getAlternativeNames(gameName)
-					if (alternatives.length > 0) {
-						tryFetchWithAlternatives(gameName, content, bazarPrice, alternatives, 0)
-					} else {
-						cache.set(normalized, { price: null, notFound: true })
-						updatePriceElement(content, null, bazarPrice, gameName, true)
-					}
-					return
-				}
-
-				const ggPrice = parseGGPrice(priceSpan.textContent.trim())
-				cache.set(normalized, { price: ggPrice, notFound: false })
-				updatePriceElement(content, ggPrice, bazarPrice, gameName, false)
-			},
-			onerror: function () {
-				updatePriceElement(content, null, bazarPrice, gameName, false)
-			},
-			ontimeout: function () {
-				updatePriceElement(content, null, bazarPrice, gameName, false)
-			},
+			updatePriceElement(
+				container,
+				result.price,
+				bazarPrice,
+				result.name,
+				bazarUrl,
+				!result.found
+			)
 		})
 	}
 
@@ -339,24 +325,19 @@
 		if (!gameLink || !priceBlock) return
 
 		const gameName = gameLink.textContent.trim()
+		const bazarUrl = gameLink.getAttribute('href')
 		const uniqueKey = gameName
 
 		if (processed.has(uniqueKey)) return
 		processed.add(uniqueKey)
 
-		// Make price block position relative
-		if (getComputedStyle(priceBlock).position === 'static') {
-			priceBlock.style.position = 'relative'
-		}
-
 		const bazarPrice = parseBazarPrice(priceBlock)
-		const { container, content } = createPriceElement(gameName)
 
+		priceBlock.innerHTML = ''
+		const container = createPriceElement(bazarPrice, bazarUrl)
 		priceBlock.appendChild(container)
 
-		setTimeout(() => {
-			fetchGGDealsPrice(gameName, content, bazarPrice)
-		}, Math.random() * 500)
+		fetchGGDealsPrice(gameName, container, bazarPrice, bazarUrl)
 	}
 
 	function scanGames() {
@@ -370,7 +351,7 @@
 		subtree: true,
 	})
 
-	setTimeout(scanGames, 500)
-	setTimeout(scanGames, 1500)
-	setTimeout(scanGames, 3000)
+	scanGames()
+	setTimeout(scanGames, 1000)
+	setTimeout(scanGames, 2500)
 })()
